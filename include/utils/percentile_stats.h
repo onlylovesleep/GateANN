@@ -29,6 +29,11 @@ namespace pipeann {
     double bd_io_us = 0;        // IO submit + poll + wait
     double bd_tunnel_us = 0;    // filter check + FullAdjIndex lookup + PQ distance
     double bd_process_us = 0;   // exact distance + neighbor expansion on IO-completed nodes
+
+    // Adaptive filter search (mode=8, opt-in)
+    double n_adaptive_promotes = 0;   // times L was raised for this query
+    double n_floor_forced = 0;        // skipped candidates forced to SSD IO by the tunnel floor
+    double effective_L = 0;           // final search budget for this query
   };
 
   inline double get_percentile_stats(QueryStats *stats, uint64_t len, float percentile,

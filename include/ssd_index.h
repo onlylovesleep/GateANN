@@ -381,6 +381,26 @@ namespace pipeann {
     void set_filter_precheck(bool v)       { filter_precheck_ = v; }
     void set_early_filter_check(bool v)    { early_filter_check_ = v; }
 
+    // Adaptive search budget for strong filtering (multi-label, mode=8).
+    // Disabled by default: the search path is byte-for-byte the original one.
+    struct AdaptiveFilterSearchConfig {
+      bool enabled = false;
+      // Raised L: observed pass rate (reads / (reads + skipped)) below this
+      // triggers budgeting the rest of the query with an enlarged candidate pool.
+      double selectivity_threshold = 0.015;
+      double l_scale = 12.8;    // L multiplier applied once per query
+      uint64_t l_scale_cap = 4096;
+      // Candidate floor for Graph Tunneling: when the skip ratio exceeds
+      // floor_skip_threshold, read up to tunnel_floor skipped candidates from
+      // SSD instead of tunneling them, bounding the reachability-only path.
+      uint32_t tunnel_floor = 0;  // 0 disables the floor
+      double floor_skip_threshold = 0.5;
+      // Minimum observed (reads + skips) before the selectivity decision fires.
+      uint32_t probe_min = 32;
+    };
+    void set_adaptive_filter_search(const AdaptiveFilterSearchConfig &cfg) { adaptive_search_ = cfg; }
+    const AdaptiveFilterSearchConfig &adaptive_filter_search() const { return adaptive_search_; }
+
    private:
     // Background insert I/O commit.
     struct BgTask {
@@ -463,6 +483,7 @@ namespace pipeann {
     std::unique_ptr<FullAdjIndex> full_adj_;
     bool filter_precheck_ = false;  // set true only for mode=8
     bool early_filter_check_ = false; // mode=9: check filter after IO, skip exact dist if non-matching
+    AdaptiveFilterSearchConfig adaptive_search_;  // mode=8 only; disabled unless set
 
     void init_buffers(uint64_t nthreads);
     void destroy_buffers();

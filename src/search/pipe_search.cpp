@@ -78,7 +78,9 @@ namespace pipeann {
 
     Timer query_timer;
 
-    const unsigned effective_lsearch = l_search;
+    // Search budget. Fixed for the whole query unless adaptive filter search
+    // promotes it once the observed filter pass rate turns out to be tiny.
+    unsigned effective_lsearch = l_search;
     std::vector<Neighbor> retset(mem_L + this->params.R + effective_lsearch * 10);
     auto &visited = *(query_buf->visited);
     unsigned cur_list_size = 0;
@@ -230,6 +232,57 @@ namespace pipeann {
 #endif
 
     std::queue<io_t> on_flight_ios;
+
+    // -------------------------------------------------------------------------
+    // Adaptive filter search (mode=8, opt-in). Two mechanisms:
+    //  1. Budget promotion: the pre-I/O filter already knows, for free, which
+    //     reached candidates would pass. Once enough candidates have been seen,
+    //     a tiny observed pass rate means the fixed L cannot cover the sparse
+    //     filtered neighborhood, so the rest of the query runs with a larger L.
+    //  2. Tunnel floor: when skips dominate the pool, tunneling alone may only
+    //     traverse invalid nodes. A bounded number of skipped candidates is read
+    //     from SSD instead, keeping reachability anchored to real distances.
+    // Both are inert unless the caller installs a config with enabled=true.
+    const AdaptiveFilterSearchConfig &adapt_cfg = this->adaptive_search_;
+    const bool adaptive_on =
+        adapt_cfg.enabled && this->filter_precheck_ && filter_data != nullptr;
+    bool budget_promoted = false;
+    unsigned observed_pass = 0, observed_skip = 0;
+    unsigned floor_forced = 0;
+
+    auto force_budget_promotion = [&]() {
+      if (!adaptive_on || budget_promoted) return;
+      budget_promoted = true;
+      double scaled = std::ceil((double) effective_lsearch * adapt_cfg.l_scale);
+      unsigned promoted = (unsigned) std::min<double>(scaled, (double) adapt_cfg.l_scale_cap);
+      promoted = (unsigned) std::max<double>(promoted, effective_lsearch);
+      if (promoted > effective_lsearch) {
+        effective_lsearch = promoted;
+        if (retset.size() < effective_lsearch) retset.resize(effective_lsearch);
+        if (stats != nullptr) stats->n_adaptive_promotes++;
+      }
+    };
+
+    auto observe_candidate = [&](bool passes) {
+      if (!adaptive_on) return;
+      if (passes) {
+        ++observed_pass;
+      } else {
+        ++observed_skip;
+      }
+      if (!budget_promoted && observed_pass + observed_skip >= adapt_cfg.probe_min &&
+          (double) observed_pass / (double) (observed_pass + observed_skip) <
+              adapt_cfg.selectivity_threshold) {
+        force_budget_promotion();
+      }
+    };
+
+    auto skip_ratio_exceeds_floor = [&]() {
+      return adapt_cfg.tunnel_floor > 0 && floor_forced < adapt_cfg.tunnel_floor &&
+             (double) observed_skip >
+                 adapt_cfg.floor_skip_threshold * (double) (observed_pass + observed_skip);
+    };
+
     auto send_read_req = [&](Neighbor &item) -> bool {
       item.flag = false;
 
@@ -307,7 +360,16 @@ namespace pipeann {
         if (this->filter_precheck_ && filter_data != nullptr &&
             ((this->filter_store_ && this->filter_store_->loaded()) ||
              (this->spmat_filter_ && this->spmat_filter_->loaded()))) {
-          if (!this->check_filter(retset[marker].id, filter_data)) {
+          bool passes = this->check_filter(retset[marker].id, filter_data);
+          observe_candidate(passes);
+          if (!passes && adaptive_on && skip_ratio_exceeds_floor()) {
+            // Floor: this skipped candidate is read anyway, trading one IO for a
+            // verified neighbor set instead of a reachability-only expansion.
+            ++floor_forced;
+            if (stats != nullptr) stats->n_floor_forced++;
+            passes = true;
+          }
+          if (!passes) {
             auto bd_tunnel_st = std::chrono::high_resolution_clock::now();
             retset[marker].flag    = false;
             retset[marker].visited = true;
@@ -370,6 +432,10 @@ namespace pipeann {
     auto calc_best_node = [&]() -> int {  // if converged.
       auto bd_proc_st = std::chrono::high_resolution_clock::now();
       unsigned marker = 0, nk = cur_list_size, first_unvisited_eager = cur_list_size;
+      // Once the tunnel floor starts reading skipped candidates, those reads must
+      // only widen the frontier: adding a filter-failing vector to full_retset
+      // would put it straight into the top-k (it is close by construction).
+      const bool floor_engaged = adaptive_on && floor_forced > 0;
       /* Process one entry from id_buf_map (disk reads or lazy hot cache hits) */
       bool processed_id_buf = false;
       for (marker = 0; marker < cur_list_size; ++marker) {
@@ -384,6 +450,8 @@ namespace pipeann {
               !this->check_filter(id, filter_data)) {
             compute_and_push_nbrs(node, nk);
             if (stats != nullptr) stats->n_filter_skip++;
+          } else if (floor_engaged && !this->check_filter(id, filter_data)) {
+            compute_and_push_nbrs(node, nk);
           } else {
             compute_exact_dists_and_push(node, id);
             compute_and_push_nbrs(node, nk);
@@ -555,6 +623,7 @@ namespace pipeann {
 
     if (stats != nullptr) {
       stats->total_us = (double) query_timer.elapsed();
+      stats->effective_L = effective_lsearch;
     }
     return t;
   }

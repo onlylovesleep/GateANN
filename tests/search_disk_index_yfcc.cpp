@@ -12,6 +12,8 @@
 //       <mode(2=pipeann,8=gateann)>
 //       <mem_L> <cache_budget>
 //       [full_adj_max_nbrs (mode=8, default=32)]
+//       [--adaptive=1 --adaptive-sel=0.015 --adaptive-scale=12.8 --adaptive-cap=4096
+//        --adaptive-probe=32 --tunnel-floor=0 --floor-skip=0.5]
 //       <L1> [L2] ...
 // =============================================================================
 
@@ -150,9 +152,36 @@ int run(int argc, char **argv) {
     full_adj_nbrs = std::atoi(argv[idx++]);
   }
 
+  // Adaptive filter search options: --key=value, ignored unless adaptive=1.
+  typename pipeann::SSDIndex<T>::AdaptiveFilterSearchConfig adaptive;
   std::vector<uint64_t> Lvec;
   for (int c = idx; c < argc; c++) {
-    uint64_t L = std::atoi(argv[c]);
+    std::string arg(argv[c]);
+    if (arg.rfind("--", 0) == 0) {
+      auto eq = arg.find('=');
+      std::string key = arg.substr(2, eq == std::string::npos ? std::string::npos : eq - 2);
+      std::string val = eq == std::string::npos ? "1" : arg.substr(eq + 1);
+      if (key == "adaptive") {
+        adaptive.enabled = std::atoi(val.c_str()) != 0;
+      } else if (key == "adaptive-sel") {
+        adaptive.selectivity_threshold = std::atof(val.c_str());
+      } else if (key == "adaptive-scale") {
+        adaptive.l_scale = std::atof(val.c_str());
+      } else if (key == "adaptive-cap") {
+        adaptive.l_scale_cap = (uint64_t)std::atoll(val.c_str());
+      } else if (key == "adaptive-probe") {
+        adaptive.probe_min = (uint32_t)std::atoi(val.c_str());
+      } else if (key == "tunnel-floor") {
+        adaptive.tunnel_floor = (uint32_t)std::atoi(val.c_str());
+      } else if (key == "floor-skip") {
+        adaptive.floor_skip_threshold = std::atof(val.c_str());
+      } else {
+        std::cerr << "Unknown option: " << arg << "\n";
+        return -1;
+      }
+      continue;
+    }
+    uint64_t L = std::atoi(arg.c_str());
     if (L >= recall_at) Lvec.push_back(L);
   }
   if (Lvec.empty()) { std::cerr << "No valid L values\n"; return -1; }
@@ -210,6 +239,14 @@ int run(int argc, char **argv) {
   if (search_mode == FILTER_AWARE_PIPE_SEARCH) {
     idx_->build_full_adj(full_adj_nbrs);
     idx_->set_filter_precheck(true);
+    if (adaptive.enabled) {
+      idx_->set_adaptive_filter_search(adaptive);
+      std::cout << "Adaptive filter search: sel_threshold=" << adaptive.selectivity_threshold
+                << " scale=" << adaptive.l_scale
+                << " cap=" << adaptive.l_scale_cap
+                << " tunnel_floor=" << adaptive.tunnel_floor
+                << " floor_skip=" << adaptive.floor_skip_threshold << std::endl;
+    }
   }
 
   // Selector for mode=2 post-filter baseline
@@ -230,9 +267,14 @@ int run(int argc, char **argv) {
             << std::setw(14) << "FilterSkips"
             << std::setw(12) << "IO_us"
             << std::setw(12) << "Tunnel_us"
-            << std::setw(12) << "Process_us"
-            << "\n";
-  std::cout << std::string(96, '-') << std::endl;
+            << std::setw(12) << "Process_us";
+  if (adaptive.enabled) {
+    std::cout << std::setw(12) << "EffL"
+              << std::setw(11) << "Promotes"
+              << std::setw(12) << "FloorReads";
+  }
+  std::cout << "\n";
+  std::cout << std::string(adaptive.enabled ? 132 : 96, '-') << std::endl;
 
   for (size_t test_id = 0; test_id < Lvec.size(); test_id++) {
     uint64_t L = Lvec[test_id];
@@ -278,6 +320,15 @@ int run(int argc, char **argv) {
     double mean_bd_process = pipeann::get_mean_stats(
         stats.data(), query_num,
         [](const pipeann::QueryStats &s) { return s.bd_process_us; });
+    double mean_eff_l = pipeann::get_mean_stats(
+        stats.data(), query_num,
+        [](const pipeann::QueryStats &s) { return s.effective_L; });
+    double mean_promotes = pipeann::get_mean_stats(
+        stats.data(), query_num,
+        [](const pipeann::QueryStats &s) { return s.n_adaptive_promotes; });
+    double mean_floor = pipeann::get_mean_stats(
+        stats.data(), query_num,
+        [](const pipeann::QueryStats &s) { return s.n_floor_forced; });
 
     std::cout << std::setw(6)  << L
               << std::setw(12) << std::fixed << std::setprecision(0) << qps
@@ -286,8 +337,13 @@ int run(int argc, char **argv) {
               << std::setw(14) << std::fixed << std::setprecision(2) << mean_filter_skip
               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_io
               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_tunnel
-              << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_process
-              << std::endl;
+              << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_process;
+    if (adaptive.enabled) {
+      std::cout << std::setw(12) << std::fixed << std::setprecision(1) << mean_eff_l
+                << std::setw(11) << std::fixed << std::setprecision(2) << mean_promotes
+                << std::setw(12) << std::fixed << std::setprecision(2) << mean_floor;
+    }
+    std::cout << std::endl;
   }
 
   delete[] query;
